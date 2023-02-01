@@ -1,0 +1,360 @@
+
+library(dplyr)
+library(data.table)
+library(stats)
+library(forecast)
+library(tseries)
+library(MLmetrics)
+library(prophet)
+library(bsts)
+library(ggplot2)
+
+
+options(repr.plot.width=5, repr.plot.height=5)
+
+
+# Get Datasets
+train = fread("train.csv")
+center_info = fread("fulfilment_center_info.csv")
+meal_info = fread("meal_info.csv")
+test = fread("test_QoiMO9B.csv")
+sample_submission <- fread("sample_submission_hSlSoT6.csv")
+
+# Create Diff_price which is the difference between the base price and checkout price
+train$diff_price <- train$base_price - train$checkout_price
+test$diff_price <- test$base_price - test$checkout_price
+center_id_list = sort(unique(test$center_id))
+meal_id_list = sort(unique(test$meal_id))
+holdout_period = 10 #length(unique(train$week )) - 104
+prediction_horizon = 10
+
+train_week = unique(train$week)
+test_week = unique(test$week)
+
+
+
+# Functions
+
+# Treat Dataframe - add missing weeks for each center_id x Mead_id
+treat_sub_df <- function(sub_df){
+  if(nrow(sub_df) <= 100){
+    return(sub_df)
+  }
+  
+  treated_sub_df <- data.frame(week=seq(from=1, to=145, by=1))
+  treated_sub_df <- merge(treated_sub_df, sub_df, by="week", all.x=TRUE)
+  treated_sub_df$center_id <- unique(sub_df$center_id)
+  treated_sub_df$meal_id <- unique(sub_df$meal_id)
+  treated_sub_df$homepage_featured <- ifelse(is.na(treated_sub_df$homepage_featured), 0, treated_sub_df$homepage_featured)
+  treated_sub_df$emailer_for_promotion <- ifelse(is.na(treated_sub_df$emailer_for_promotion), 0, treated_sub_df$emailer_for_promotion)
+  treated_sub_df$diff_price <- ifelse(is.na(treated_sub_df$diff_price), 0, treated_sub_df$diff_price)
+  
+  prev_num_order <- 0
+  for(i in treated_sub_df$week){
+    if(is.na(treated_sub_df[treated_sub_df$week==i,]$num_orders)){
+      treated_sub_df[treated_sub_df$week==i,]$num_orders <- prev_num_order
+    } else {
+      prev_num_order <- treated_sub_df[treated_sub_df$week==i,]$num_orders
+    }
+    
+  }
+  return(treated_sub_df)
+}
+
+
+# Function for getting output from ARIMA
+model_arima <- function(sub_df2, test_df, prediction_horizon){
+  
+  sub_ts <- ts(sub_df2$num_orders, frequency=52)
+  xreg_train <- as.matrix(sub_df2[,c("diff_price", "homepage_featured")])
+  
+  xreg_test_df <- data.frame(week = seq(from=146, to=155, by=1))
+  xreg_test_df <- merge(xreg_test_df, test_df[,c("week", "homepage_featured", "diff_price")], by='week', all.x=TRUE)
+  xreg_test_df$homepage_featured <- ifelse(is.na(xreg_test_df$homepage_featured), 0, xreg_test_df$homepage_featured)
+  xreg_test_df$diff_price <- ifelse(is.na(xreg_test_df$diff_price), 0, xreg_test_df$diff_price)
+  xreg_test <- as.matrix(xreg_test_df[,c("diff_price", "homepage_featured")])
+  if(nrow(sub_df2) >= 104){
+    arima <- auto.arima(sub_ts, xreg=xreg_train, seasonal=TRUE)
+  } else{
+    arima <- auto.arima(sub_ts, xreg=xreg_train, seasonal=FALSE)  
+  }
+  forecast_arima <- forecast(arima, h=prediction_horizon, xreg=xreg_test)
+  #print(forecast_arima$mean)
+  forecast_df <- data.frame(forecast_val=as.numeric(forecast_arima$mean))
+  return(forecast_df)
+}
+
+
+# Function for getting output from Prophet
+model_prophet <- function(sub_df2, test_df){
+  #ts_df <- sub_ts
+  # xreg <- xreg_train
+  
+  ds <- seq(as.Date('2017-01-01'), by ="w", length=nrow(sub_df2))
+  df <- data.frame(ds=ds, y=sub_df2$num_orders)
+  m <- prophet(weekly.seasonality = TRUE, daily.seasonality = FALSE)
+  x_reg_diff_price <- data.frame(ds=ds, x_reg_diff_price = as.matrix(sub_df2$diff_price))
+  x_reg_hf <- data.frame(ds=ds, x_reg_hf = as.matrix(sub_df2$homepage_featured))
+  m <- add_regressor(m, "x_reg_diff_price", standardize = FALSE)
+  m <- add_regressor(m, "x_reg_hf", standardize = FALSE)
+  
+  ds2 <- merge(df, x_reg_diff_price, by='ds', all.x=TRUE)
+  ds2 <- merge(ds2, x_reg_hf, by='ds', all.x=TRUE)
+  ds2$x_reg_diff_price <- ifelse(is.na(ds2$x_reg_diff_price), 0, ds2$x_reg_diff_price)
+  ds2$x_reg_hf <- ifelse(is.na(ds2$x_reg_hf), 0, ds2$x_reg_hf)
+  #setnames(ds, "xreg_train", "x_mat1")
+  m <- fit.prophet(m, ds2)
+  future <- make_future_dataframe(m, period=holdout_period, freq='week', include_history = FALSE)
+  #future <- merge(future, x_mat1, by='ds', all.x=TRUE)
+  
+  
+  xreg_test_df <- data.frame(week = sort(unique(test$week)))
+  xreg_test_df$ds <- seq(as.Date("2019-10-13"), by="w", length=nrow(xreg_test_df))
+  xreg_test_df <- merge(xreg_test_df, test_df[,c("week", "diff_price", "homepage_featured")], by="week", all.x=TRUE)
+  xreg_test_df$diff_price <- ifelse(is.na(xreg_test_df$diff_price), 0, xreg_test_df$diff_price)
+  xreg_test_df$homepage_featured <- ifelse(is.na(xreg_test_df$homepage_featured), 0, xreg_test_df$homepage_featured)
+  
+  future$x_reg_diff_price <- xreg_test_df$diff_price
+  future$x_reg_hf <- xreg_test_df$homepage_featured
+  forecast_prophet <- predict(m, future)
+  forecast_df <- data.frame(forecast_val=as.numeric(forecast_prophet$yhat))
+  return(forecast_df)
+}
+
+
+
+# Exploring the BSTS (Bayesian Structural Time Series) Model
+model_bsts <- function(sub_df2, test_df){
+  
+  xreg_test_df <- data.frame(week = sort(unique(test$week)))
+  xreg_test_df$ds <- seq(as.Date("2019-10-13"), by="w", length=nrow(xreg_test_df))
+  xreg_test_df <- merge(xreg_test_df, test_df[,c("week", "diff_price", "homepage_featured")], by="week", all.x=TRUE)
+  xreg_test_df$diff_price <- ifelse(is.na(xreg_test_df$diff_price), 0, xreg_test_df$diff_price)
+  xreg_test_df$homepage_featured <- ifelse(is.na(xreg_test_df$homepage_featured), 0, xreg_test_df$homepage_featured)
+  
+  sub_df2$diff_price <- abs(sub_df2$diff_price)
+  xreg_test_df$diff_price <- abs(xreg_test_df$diff_price)
+  
+  y <- sub_df2$num_orders
+  #y <- log10(y)
+  ss <- list()
+  ss <- AddSemilocalLinearTrend(list(), y)
+  #ss <- AddAr(ss, y)
+  ss <- AddSeasonal(ss, y, nseasons=52)
+  ss <- AddDynamicRegression(ss, y~as.matrix(sub_df2[,c("diff_price", "homepage_featured")]))
+  bsts.model <- bsts(y, state.specification = ss, niter=500, ping=0, seed=2020)
+  burn <- SuggestBurn(0.1, bsts.model)
+  
+  p <- predict.bsts(bsts.model, 
+                    horizon=prediction_horizon, 
+                    burn=burn, 
+                    quantiles=c(0.025, 0.975), 
+                    newdata = as.matrix(xreg_test_df[,c("diff_price", "homepage_featured")]))
+  
+  forecast_df <- data.frame(forecast_val=as.numeric(p$mean))
+  return(forecast_df)
+}
+
+
+
+
+# Using MAPE to get best Model
+find_best_model <- function(sub_df_t, holdout_period){
+  
+  sub_df_1 <- sub_df_t[1:(nrow(sub_df_t)-holdout_period),]
+  sub_df_hold <- sub_df_t[(nrow(sub_df_t)-holdout_period+1):nrow(sub_df_t),]
+  mape_df <- data.frame(actual = sub_df_hold$num_orders)
+  
+  # Arima
+  tryCatch({
+    arima <- auto.arima(sub_df_1$num_orders,seasonal=TRUE, xreg= as.matrix(sub_df_1[,c("diff_price", "homepage_featured")]))
+    holdout_forecast <- forecast(arima, h=holdout_period, xreg=as.matrix(sub_df_hold[,c("diff_price", "homepage_featured")]))
+    mape_df$arima <- holdout_forecast$mean
+  }, error = function(e){
+  })
+  
+  # Prophet
+  tryCatch({
+    ds <- seq(as.Date('2017-01-01'), by ="w", length=nrow(sub_df_1))
+    df <- data.frame(ds=ds, y=sub_df_1$num_orders)
+    m <- prophet(weekly.seasonality = TRUE, daily.seasonality = FALSE)
+    x_reg_diff_price <- data.frame(ds=ds, x_reg_diff_price = as.matrix(sub_df_1[,c("diff_price")]))
+    x_reg_hf <- data.frame(ds=ds, x_reg_hf = as.matrix(sub_df_1[,c("homepage_featured")]))
+    m <- add_regressor(m, "x_reg_diff_price", standardize = FALSE)
+    m <- add_regressor(m, "x_reg_hf", standardize = FALSE)
+    ds2 <- merge(df, x_reg_diff_price, by='ds', all.x=TRUE)
+    ds2 <- merge(ds2, x_reg_hf, by='ds', all.x=TRUE)
+    ds2[is.na(ds2$x_reg_diff_price)]$x_reg_diff_price <- 0
+    ds2[is.na(ds2$x_reg_hf)]$x_reg_hf <- 0
+    #setnames(ds2, "xreg_train", "x_mat1")
+    m <- fit.prophet(m, ds2)
+    future <- make_future_dataframe(m, period=holdout_period, freq='week', include_history = FALSE)
+    #future <- merge(future, x_mat1, by='ds', all.x=TRUE)
+    names(future)
+    future$x_reg_diff_price <- sub_df_hold$diff_price
+    future$x_reg_hf <- sub_df_hold$homepage_featured
+    
+    holdout_forecast_p <- predict(m, future)
+    mape_df$prophet <- holdout_forecast_p$yhat
+  }, error = function(e){
+  })
+  
+  # BSTS
+  tryCatch({
+    sub_df_hold$diff_price <- abs(sub_df_hold$diff_price)
+    sub_df_1$diff_price <- abs(sub_df_1$diff_price)
+    y <- sub_df_1$num_orders
+    #y <- log10(y)
+    ss <- list()
+    ss <- AddSemilocalLinearTrend(list(), y)
+    #ss <- AddAr(ss, y)
+    ss <- AddSeasonal(ss, y, nseasons=52)
+    ss <- AddDynamicRegression(ss, y~as.matrix(sub_df_1[,c("diff_price", "homepage_featured")]))
+    bsts.model <- bsts(y, state.specification = ss, niter=500, ping=0, seed=2020)
+    burn <- SuggestBurn(0.1, bsts.model)
+    
+    p <- predict.bsts(bsts.model, 
+                      horizon=holdout_period, 
+                      burn=burn, 
+                      quantiles=c(0.025, 0.975), 
+                      newdata = as.matrix(sub_df_hold[,c("diff_price", "homepage_featured")]))
+    mape_df$bsts <- p$mean
+  }, error = function(e){
+  })
+  
+  mape_df2 <- data.frame(
+    model = as.character(),
+    mape = as.double()
+  )
+  
+  
+  mape_df2 = rbind(mape_df2, data.frame(model = "Arima", mape = MAPE(mape_df$arima, mape_df$actual)))
+  mape_df2 = rbind(mape_df2, data.frame(model = "Prophet",mape = MAPE(mape_df$prophet, mape_df$actual)))
+  mape_df2 = rbind(mape_df2, data.frame(model = "BSTS",mape = MAPE(mape_df$bsts, mape_df$actual)))
+  mape_df2 <- mape_df2[order(mape_df2$mape),]
+  return(mape_df2)
+}
+
+
+
+output_df <- data.frame(
+  center_id=int(),
+  meal_id=int(),
+  week=int(),
+  forecast_val=double()
+)
+
+
+
+# Execute model
+stopper = 0
+stop_a = 1
+for (center_id_i in center_id_list){
+  #if (stopper >= stop_a){ break}
+  for (meal_id_j in meal_id_list){
+    print(c('Center:', center_id_i))
+    print(c('Meal:', meal_id_j))
+    #if (stopper >= stop_a){ break}
+    if (stopper %%100==0){print(stopper)}
+    
+    sub_df <- train[train$center_id==center_id_i & train$meal_id==meal_id_j]
+    if (nrow(sub_df) <= 10){next}
+    sub_df_t <- treat_sub_df(sub_df)
+    
+    mape_df2 <- find_best_model(sub_df_t, holdout_period)
+    mape_df3 <- mape_df2[1,]
+    
+    print(mape_df3$model)
+    
+    
+    test_df <- test[test$center_id==center_id_i & test$meal_id==meal_id_j]
+    if (nrow(sub_df) <= 10){next}
+    sub_df2 <- data.frame(week = train_week)
+    sub_df2 <- merge(sub_df2, sub_df_t[,c("week", "num_orders", "diff_price", "homepage_featured")], by="week", all.x=TRUE)
+    sub_df2[is.na(sub_df2)] = 0
+    
+    model_flag = 0
+    if(mape_df3$model=='Arima'){
+      tryCatch({
+      forecast_df <- model_arima(sub_df2, test_df, prediction_horizon)
+      }, error = function(e){
+      })
+    } else if(mape_df3$model == 'Prophet'){
+      forecast_df <- model_prophet(sub_df2, test_df)
+    } else if(mape_df3$model == 'BSTS'){
+      forecast_df <- model_bsts(sub_df2, test_df)
+    }
+    
+    #forecast_df <- model_arima(sub_df2, test_df, prediction_horizon)
+    forecast_df$center_id <- center_id_i
+    forecast_df$meal_id <- meal_id_j
+    forecast_df$week <- test_week
+    
+    output_df <- rbind(output_df, forecast_df[,c(2,3,4,1)])
+    stopper = stopper + 1
+  }
+}
+
+
+
+test_out <- merge(x=test, y=output_df, by=c("meal_id", "center_id", "week"), all.x=TRUE)
+
+sum(is.na(test_out$forecast_val))
+
+test_out[is.na(test_out$forecast_val),] %>%
+  group_by(center_id, meal_id) %>%
+  summarise(n())
+
+center_id_i = 10
+meal_id_j = 1109
+
+graph_df <- train$num_orders[train$center_id==center_id_i & train$meal_id==meal_id_j]
+plot(graph_df, type='l')
+output_df[output_df$center_id==center_id_i & output_df$meal_id==meal_id_j]
+
+train$emailer_for_promotion[train$center_id==center_id_i & train$meal_id==meal_id_j]
+
+
+
+out_a <- fread("output_04_a.csv")
+out_b <- fread("output_04_b.csv")
+out_c <- fread("output_04_c.csv")
+
+output_combined <- rbind(out_a, out_b, out_c)
+output_combined$V1 <- NULL
+
+output_combined <- unique(output_combined)
+
+# submission file
+test_out <- merge(test[,c("id", "center_id", "meal_id", "week")], output_combined, by = c("center_id", "meal_id", "week"), all.x=TRUE)
+
+setnames(test_out, "forecast_val", "num_orders")
+test_out$num_orders[is.na(test_out$num_orders)] <- 0
+test_out$num_orders[test_out$num_orders<=0] <- 0
+submission_df <- test_out[,c("id", "num_orders")]
+write.csv(submission_df, "submission2.csv", row.names=FALSE)
+sum(is.na(submission_df$num_orders))
+
+output_combined %>%
+  group_by(center_id, meal_id) %>%
+  summarise(n_distinct(week))
+df1 <- test %>%
+  group_by(center_id, meal_id) %>%
+  summarise(n_distinct(week))
+df2 <- test_out %>%
+  group_by(center_id, meal_id) %>%
+  summarise(n_distinct(week))
+setnames(df2, "n_distinct(week)", "dis")
+df3 <- merge(df1, df2, all.x = TRUE, by = c("center_id", "meal_id"))
+df3$flag <- ifelse(df3$`n_distinct(week)` == df3$dis, 1, 0)
+df3[df3$flag == 0]
+
+df4 <- test_out %>%
+  group_by(center_id, meal_id, week) %>%
+  summarise(n = n())
+df4[df4$n == 2,]
+
+test_out <- test_out %>%
+  group_by(center_id, meal_id, week, id) %>%
+  summarise(num_orders = max(num_orders))
+
